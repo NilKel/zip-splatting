@@ -18,7 +18,11 @@ import cv2
 WARNED = False
 
 def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dataset):
-    image = Image.open(cam_info.image_path)
+    # Use pre-processed image if available (with background applied), otherwise read from disk
+    if cam_info.image is not None:
+        image = cam_info.image
+    else:
+        image = Image.open(cam_info.image_path)
 
     if cam_info.depth_path != "":
         try:

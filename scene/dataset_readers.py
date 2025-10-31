@@ -36,6 +36,7 @@ class CameraInfo(NamedTuple):
     width: int
     height: int
     is_test: bool
+    image: Image.Image = None  # Modified image with background applied (optional)
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -111,7 +112,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, depth_params=depth_params,
                               image_path=image_path, image_name=image_name, depth_path=depth_path,
-                              width=width, height=height, is_test=image_name in test_cam_names_list)
+                              width=width, height=height, is_test=image_name in test_cam_names_list, image=None)
         cam_infos.append(cam_info)
 
     sys.stdout.write('\n')
@@ -249,14 +250,34 @@ def readCamerasFromTransforms(path, transformsfile, depths_folder, white_backgro
             image_path = os.path.join(path, cam_name)
             image_name = Path(cam_name).stem
             image = Image.open(image_path)
-
-            im_data = np.array(image.convert("RGBA"))
+            
+            # Check if image has alpha channel
+            has_alpha = image.mode in ('RGBA', 'LA') or 'transparency' in image.info
+            
+            if has_alpha:
+                im_data = np.array(image.convert("RGBA"))
+            else:
+                # For RGB images without alpha, we need special handling
+                im_data = np.array(image.convert("RGB"))
+                if white_background:
+                    # If white_background is True and no alpha, treat very dark pixels as background
+                    # This handles cases where images don't have proper alpha channels
+                    # Threshold: pixels with average RGB < 0.01 are considered background
+                    dark_mask = (im_data.mean(axis=2, keepdims=True) < 2.55)  # ~1% of 255
+                    # Create alpha: 0 for dark pixels (background), 255 for others
+                    alpha = np.where(dark_mask, 0, 255).astype(im_data.dtype)
+                    im_data = np.concatenate([im_data, alpha], axis=2)
+                else:
+                    # For black background, just add full opacity
+                    alpha = np.ones((im_data.shape[0], im_data.shape[1], 1), dtype=im_data.dtype) * 255
+                    im_data = np.concatenate([im_data, alpha], axis=2)
 
             bg = np.array([1,1,1]) if white_background else np.array([0, 0, 0])
 
             norm_data = im_data / 255.0
+            # Properly composite: RGB * alpha + background * (1 - alpha)
             arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
-            image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
+            image = Image.fromarray((np.clip(arr * 255.0, 0, 255)).astype(np.uint8), "RGB")
 
             fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
             FovY = fovy 
@@ -264,9 +285,11 @@ def readCamerasFromTransforms(path, transformsfile, depths_folder, white_backgro
 
             depth_path = os.path.join(depths_folder, f"{image_name}.png") if depths_folder != "" else ""
 
+            # Store the modified image with background applied
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX,
                             image_path=image_path, image_name=image_name,
-                            width=image.size[0], height=image.size[1], depth_path=depth_path, depth_params=None, is_test=is_test))
+                            width=image.size[0], height=image.size[1], depth_path=depth_path, 
+                            depth_params=None, is_test=is_test, image=image))
             
     return cam_infos
 

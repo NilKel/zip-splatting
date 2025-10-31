@@ -54,6 +54,8 @@ class Camera(nn.Module):
                 self.alpha_mask[..., self.alpha_mask.shape[-1] // 2:] = 0
 
         self.original_image = gt_image.clamp(0.0, 1.0).to(self.data_device)
+        # Apply alpha mask to original_image (fixes issue where alpha mask wasn't applied)
+        self.original_image *= self.alpha_mask
         self.image_width = self.original_image.shape[2]
         self.image_height = self.original_image.shape[1]
 

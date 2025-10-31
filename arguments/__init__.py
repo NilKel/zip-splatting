@@ -26,6 +26,9 @@ class ParamGroup:
                 key = key[1:]
             t = type(value)
             value = value if not fill_none else None 
+            # Handle None values - use str type for None defaults
+            if value is None:
+                t = str
             if shorthand:
                 if t == bool:
                     group.add_argument("--" + key, ("-" + key[0:1]), default=value, action="store_true")
@@ -56,6 +59,12 @@ class ModelParams(ParamGroup):
         self.train_test_exp = False
         self.data_device = "cuda"
         self.eval = False
+        # Vector potential and confidence field parameters
+        self.use_vector_potential = False
+        self.confidence_grid_resolution = 128
+        self.confidence_grid_path = ""
+        self.name = None
+        self.method = "baseline"
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -97,6 +106,7 @@ class OptimizationParams(ParamGroup):
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
+        self.test_image_stride = 25
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

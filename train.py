@@ -22,6 +22,9 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+from lpipsPyTorch.modules.lpips import LPIPS
+import torchvision
+from os import makedirs
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -111,9 +114,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
-        if viewpoint_cam.alpha_mask is not None:
-            alpha_mask = viewpoint_cam.alpha_mask.cuda()
-            image *= alpha_mask
+        # if viewpoint_cam.alpha_mask is not None:
+        #     alpha_mask = viewpoint_cam.alpha_mask.cuda()
+        #     image *= alpha_mask
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
@@ -188,25 +191,130 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+    
+    # Render test images at the end of training
+    if opt.test_image_stride > 0:
+        render_test_images(scene, gaussians, pipe, background, dataset.model_path, opt.test_image_stride, dataset.train_test_exp, SPARSE_ADAM_AVAILABLE)
 
-def prepare_output_and_logger(args):    
-    if not args.model_path:
-        if os.getenv('OAR_JOB_ID'):
-            unique_str=os.getenv('OAR_JOB_ID')
+def render_test_images(scene, gaussians, pipeline, background, model_path, stride, train_test_exp, separate_sh):
+    """Render test images with GT and rendered views separately"""
+    print("\n[Rendering test images with stride {}]".format(stride))
+    test_cameras = scene.getTestCameras()
+    if len(test_cameras) == 0:
+        print("No test cameras found, skipping test image rendering.")
+        return
+    
+    # Create output directory
+    test_images_path = os.path.join(model_path, "test_images")
+    makedirs(test_images_path, exist_ok=True)
+    
+    # Get indices to render: 0, stride, 2*stride, ...
+    indices_to_render = list(range(0, len(test_cameras), stride))
+    cameras_to_render = [test_cameras[i] for i in indices_to_render]
+    print(f"Rendering {len(cameras_to_render)} out of {len(test_cameras)} test images")
+    
+    # Prepare metrics
+    metrics_path = os.path.join(test_images_path, "metrics.txt")
+    psnr_sum = 0.0
+    ssim_sum = 0.0
+    lpips_sum = 0.0
+    num_imgs = 0
+    
+    # LPIPS model expects inputs in [-1, 1]
+    lpips_model = LPIPS().cuda().eval()
+    
+    with torch.no_grad():
+        with open(metrics_path, "w") as mf:
+            mf.write("index, PSNR, SSIM, LPIPS\n")
+            for actual_idx, view in zip(indices_to_render, tqdm(cameras_to_render, desc="Rendering test images")):
+                rendering = render(view, gaussians, pipeline, background, use_trained_exp=train_test_exp, separate_sh=separate_sh)["render"]
+                gt = view.original_image[0:3, :, :]
+                
+                if train_test_exp:
+                    rendering = rendering[..., rendering.shape[-1] // 2:]
+                    gt = gt[..., gt.shape[-1] // 2:]
+                
+                # Clamp to [0, 1]
+                rendering = torch.clamp(rendering, 0.0, 1.0)
+                gt = torch.clamp(gt, 0.0, 1.0)
+                
+                # Save GT and rendered images in same folder with index-based naming
+                torchvision.utils.save_image(gt, os.path.join(test_images_path, '{0}_gt.png'.format(actual_idx)))
+                torchvision.utils.save_image(rendering, os.path.join(test_images_path, '{0}_r.png'.format(actual_idx)))
+
+                # Metrics
+                psnr_val = psnr(rendering.unsqueeze(0), gt.unsqueeze(0)).mean().item()
+                try:
+                    from fused_ssim import fused_ssim as _fssim
+                    ssim_val = _fssim(rendering.unsqueeze(0), gt.unsqueeze(0)).item()
+                except Exception:
+                    ssim_val = ssim(rendering, gt).item() if hasattr(ssim(rendering, gt), 'item') else float(ssim(rendering, gt))
+                lpips_val = lpips_model(2.0 * rendering.unsqueeze(0) - 1.0, 2.0 * gt.unsqueeze(0) - 1.0).mean().item()
+
+                psnr_sum += psnr_val
+                ssim_sum += ssim_val
+                lpips_sum += lpips_val
+                num_imgs += 1
+
+                mf.write(f"{actual_idx}, {psnr_val:.6f}, {ssim_val:.6f}, {lpips_val:.6f}\n")
+            if num_imgs > 0:
+                mf.write("AVERAGES\n")
+                mf.write(f"PSNR: {psnr_sum/num_imgs:.6f}\n")
+                mf.write(f"SSIM: {ssim_sum/num_imgs:.6f}\n")
+                mf.write(f"LPIPS: {lpips_sum/num_imgs:.6f}\n")
+    
+    print(f"Test images saved to {test_images_path}")
+
+def prepare_output_and_logger(dataset):    
+    if not dataset.model_path:
+        if dataset.name:
+            # Extract dataset and scene names from source path
+            source_path = os.path.abspath(dataset.source_path)
+            path_parts = source_path.split(os.sep)
+            
+            # Try to find dataset name (e.g., "nerf_synthetic") and scene name (e.g., "drums")
+            # Look for common patterns: .../dataset/scene or .../dataset/.../scene
+            dataset_name = "unknown"
+            scene_name = "unknown"
+            
+            # Common dataset names to look for
+            dataset_keywords = ["nerf_synthetic", "nerf_synthetic_colmap", "mipnerf360", "tanksandtemples", "deepblending"]
+            for keyword in dataset_keywords:
+                if keyword in path_parts:
+                    dataset_idx = path_parts.index(keyword)
+                    dataset_name = keyword
+                    # Scene name is typically the next directory or the last part
+                    if dataset_idx + 1 < len(path_parts):
+                        scene_name = path_parts[dataset_idx + 1]
+                    elif len(path_parts) > 0:
+                        scene_name = path_parts[-1]
+                    break
+            
+            # If no dataset keyword found, use parent directory as dataset and last part as scene
+            if dataset_name == "unknown" and len(path_parts) >= 2:
+                dataset_name = path_parts[-2] if len(path_parts) >= 2 else "unknown"
+                scene_name = path_parts[-1]
+            
+            # Construct output path: output/dataset/scene/method/name
+            dataset.model_path = os.path.join("./output/", dataset_name, scene_name, dataset.method, dataset.name)
         else:
-            unique_str = str(uuid.uuid4())
-        args.model_path = os.path.join("./output/", unique_str[0:10])
+            # Fallback to original UUID-based naming
+            if os.getenv('OAR_JOB_ID'):
+                unique_str=os.getenv('OAR_JOB_ID')
+            else:
+                unique_str = str(uuid.uuid4())
+            dataset.model_path = os.path.join("./output/", unique_str[0:10])
         
     # Set up output folder
-    print("Output folder: {}".format(args.model_path))
-    os.makedirs(args.model_path, exist_ok = True)
-    with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
-        cfg_log_f.write(str(Namespace(**vars(args))))
+    print("Output folder: {}".format(dataset.model_path))
+    os.makedirs(dataset.model_path, exist_ok = True)
+    with open(os.path.join(dataset.model_path, "cfg_args"), 'w') as cfg_log_f:
+        cfg_log_f.write(str(Namespace(**vars(dataset))))
 
     # Create Tensorboard writer
     tb_writer = None
     if TENSORBOARD_FOUND:
-        tb_writer = SummaryWriter(args.model_path)
+        tb_writer = SummaryWriter(dataset.model_path)
     else:
         print("Tensorboard not available: not logging progress")
     return tb_writer
