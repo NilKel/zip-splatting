@@ -113,44 +113,78 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     #     print("OccGridEstimator initialized successfully.")
 
-    # Initialize MLP for neural interval rendering (mlp-nerf mode)
+    # Initialize MLP for neural interval rendering (mlp-nerf or mlp-opacity mode)
     mlp = None
     mlp_optimizer = None
-    if opt.blending == "mlp-nerf":
+    render_fn = None
+    
+    if opt.blending in ["mlp-nerf", "mlp-opacity"]:
         if not TCNN_AVAILABLE:
-            sys.exit("MLP-NeRF blending requires tiny-cuda-nn, but it's not available. Please install tiny-cuda-nn.")
+            sys.exit(f"{opt.blending} blending requires tiny-cuda-nn, but it's not available. Please install tiny-cuda-nn.")
 
-        print(f"Initializing MLP for Neural Interval Splatting...")
-        print(f"  Feature dim: {gaussians.feature_dim}")
-        print(f"  Output: 4 (RGB + density)")
+        # Use two-stage MLP architecture (NeRF-style)
+        from utils.neural_mlp import create_interval_mlp
 
-        # Create tiny-cuda-nn MLP
-        # Input: neural features [feature_dim]
-        # Output: 4 (RGB + density)
-        mlp_config = {
-            "encoding": {
-                "otype": "Identity"  # No encoding, just pass features through
-            },
-            "network": {
-                "otype": "FullyFusedMLP",
-                "activation": "ReLU",
-                "output_activation": "None",
-                "n_neurons": 64,
-                "n_hidden_layers": 2
-            }
-        }
+        if opt.blending == "mlp-opacity":
+            print(f"Initializing MLP for MLP-Opacity mode...")
+            print(f"  Feature dim: {gaussians.feature_dim}")
+            print(f"  Output: 3 (RGB only, opacity from rasterization)")
+            
+            # RGB-only MLP
+            mlp = create_interval_mlp(
+                feature_dim=gaussians.feature_dim,
+                rgb_only=True,
+                sh_degree=4,
+                color_hidden_dim=64,
+                color_n_hidden=2
+            ).to("cuda")
+            
+            # Import render function for MLP-opacity mode
+            from gaussian_renderer.mlp_opacity_render import render_mlp_opacity
+            render_fn = render_mlp_opacity
+            
+        else:  # mlp-nerf (original two-stage)
+            print(f"Initializing MLP for Neural Interval Splatting (MLP-NeRF)...")
+            print(f"  Feature dim: {gaussians.feature_dim}")
+            print(f"  Output: 4 (RGB + density)")
+            
+            # Two-stage MLP (original)
+            mlp = create_interval_mlp(
+                feature_dim=gaussians.feature_dim,  # Input aggregated features (e.g., 32)
+                geo_feat_dim=16,  # Density + 15D geometric features
+                sh_degree=4,  # Spherical harmonics degree for view direction
+                density_hidden_dim=64,  # Hidden dim for density MLP
+                color_hidden_dim=64,  # Hidden dim for color MLP
+                density_n_hidden=2,  # Number of hidden layers in density MLP
+                color_n_hidden=2,  # Number of hidden layers in color MLP
+                two_stage=True
+            ).to("cuda")
+            
+            # Import render function for MLP-nerf mode
+            from gaussian_renderer.neural_render import render_neural_intervals
+            render_fn = render_neural_intervals
 
-        mlp = tcnn.NetworkWithInputEncoding(
-            n_input_dims=gaussians.feature_dim,
-            n_output_dims=4,  # RGB + density
-            encoding_config=mlp_config["encoding"],
-            network_config=mlp_config["network"]
-        ).to("cuda")
+        # IMPORTANT: "Warm up" tiny-cuda-nn with a small batch to set internal buffer size
+        # This prevents it from trying to allocate huge buffers later
+        print("Warming up MLP with small batch...")
+        with torch.no_grad():
+            dummy_features = torch.randn(1024, gaussians.feature_dim, device='cuda', dtype=torch.float16)
+            dummy_viewdirs = torch.randn(1024, 3, device='cuda', dtype=torch.float16)
+            dummy_viewdirs = dummy_viewdirs / (torch.norm(dummy_viewdirs, dim=-1, keepdim=True) + 1e-6)
+            _ = mlp(dummy_features, dummy_viewdirs)
+            del dummy_features, dummy_viewdirs, _
+            torch.cuda.empty_cache()
 
-        # Create optimizer for MLP
+        # Create optimizer for MLP (covers both density and color MLPs)
         mlp_optimizer = torch.optim.Adam(mlp.parameters(), lr=1e-3)
 
-        print("MLP initialized successfully.")
+        print(f"MLP initialized successfully.")
+        print(f"  Total parameters: {mlp.num_parameters()}")
+        if opt.blending == "mlp-nerf":
+            print(f"  Density MLP: {mlp.density_mlp.num_parameters()} params")
+            print(f"  Color MLP: {mlp.color_mlp.num_parameters()} params")
+        else:
+            print(f"  RGB-only MLP: {mlp.num_parameters()} params")
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -252,9 +286,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         #                 print(f"[Iter {iteration}] Grid occupancy: {occupancy_pct:.2f}% ({occupied_voxels}/{total_voxels} voxels)")
 
         # Render: Use appropriate renderer based on method and blending mode
-        if dataset.method == "zip" and opt.blending == "mlp-nerf":
+        if dataset.method == "zip" and opt.blending in ["mlp-nerf", "mlp-opacity"]:
             # Use Neural Interval Splatting renderer
-            render_pkg = render_neural_intervals(
+            render_pkg = render_fn(
                 viewpoint_cam, gaussians, mlp, pipe, bg,
                 num_intervals=opt.num_intervals,
                 near_depth=opt.near_plane,
@@ -322,7 +356,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # For neural rendering, create dummy gradients for screenspace points
         # since they're not connected to the loss (we optimize neural features instead)
-        if opt.blending == "mlp-nerf" and viewspace_point_tensor.grad is None:
+        if opt.blending in ["mlp-nerf", "mlp-opacity"] and viewspace_point_tensor.grad is None:
             viewspace_point_tensor.grad = torch.zeros_like(viewspace_point_tensor)
 
         iter_end.record()
@@ -386,9 +420,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     
     # Render test images at the end of training
     if opt.test_image_stride > 0:
-        render_test_images(scene, gaussians, pipe, background, dataset, opt, estimator, SPARSE_ADAM_AVAILABLE, mlp)
+        render_test_images(scene, gaussians, pipe, background, dataset, opt, estimator, SPARSE_ADAM_AVAILABLE, mlp, render_fn)
 
-def render_test_images(scene, gaussians, pipeline, background, dataset, opt, estimator, separate_sh, mlp=None):
+def render_test_images(scene, gaussians, pipeline, background, dataset, opt, estimator, separate_sh, mlp=None, render_fn=None):
     """Render test images with GT and rendered views separately"""
     stride = opt.test_image_stride
     print("\n[Rendering test images with stride {}]".format(stride))
@@ -421,9 +455,9 @@ def render_test_images(scene, gaussians, pipeline, background, dataset, opt, est
             mf.write("index, PSNR, SSIM, LPIPS\n")
             for actual_idx, view in zip(indices_to_render, tqdm(cameras_to_render, desc="Rendering test images")):
                 # Use appropriate renderer based on method and blending mode
-                if dataset.method == "zip" and opt.blending == "mlp-nerf" and mlp is not None:
+                if dataset.method == "zip" and opt.blending in ["mlp-nerf", "mlp-opacity"] and mlp is not None:
                     # Use Neural Interval Splatting renderer
-                    rendering = render_neural_intervals(
+                    rendering = render_fn(
                         view, gaussians, mlp, pipeline, background,
                         num_intervals=16,
                         near_depth=0.1,

@@ -1,10 +1,14 @@
 #
-# Neural Interval Splatting Renderer
+# MLP-Opacity Mode Renderer
 #
-# Three-phase rendering pipeline:
-# 1. Aggregate neural features into depth intervals (CUDA)
-# 2. Decode features to RGB+density using MLP (Python/tiny-cuda-nn)
-# 3. Composite intervals into final image (CUDA)
+# Three-phase rendering pipeline for MLP-opacity mode:
+# 1. Aggregate neural features + rasterized opacities into depth intervals (CUDA)
+# 2. Decode features to RGB using MLP (Python/tiny-cuda-nn) - NO DENSITY PREDICTION
+# 3. Composite intervals using rasterized opacity for density (CUDA)
+#
+# Key difference from neural_render.py:
+# - MLP only predicts RGB (view-dependent color)
+# - Density comes from rasterized Gaussian opacities (not MLP)
 #
 
 import torch
@@ -12,11 +16,11 @@ import math
 from diff_gaussian_rasterization import (
     GaussianRasterizationSettings,
     rasterize_neural_intervals,
-    composite_neural
+    composite_mlp_opacity
 )
 
 
-def render_neural_intervals(
+def render_mlp_opacity(
     viewpoint_camera,
     pc,
     mlp,
@@ -33,12 +37,16 @@ def render_neural_intervals(
     scene_aabb=None
 ):
     """
-    Render a Gaussian Splatting scene using neural interval splatting.
+    Render a Gaussian Splatting scene using MLP-opacity mode.
+
+    In this mode:
+    - Gaussian opacities drive density (rasterized)
+    - MLP only predicts RGB color (view-dependent)
 
     Args:
         viewpoint_camera: Camera object with pose and intrinsics
         pc: GaussianModel with neural features
-        mlp: tiny-cuda-nn MLP for decoding features to RGB+density
+        mlp: RGB-only MLP (RGBOnlyMLP instance)
         pipe: PipelineParams
         bg_color: [3] Background color tensor
         num_intervals: Number of depth intervals
@@ -106,8 +114,6 @@ def render_neural_intervals(
 
     # Get neural features
     features_neural = pc.get_features_neural  # [N, feature_dim]
-
-    # TEMP DEBUG: Ensure features are contiguous and properly allocated
     features_neural = features_neural.contiguous()
 
     # Validate feature dimension
@@ -117,48 +123,15 @@ def render_neural_intervals(
             f"got {features_neural.shape[1]}"
         )
 
-    # Phase 1: Aggregate features into depth intervals
-    # Output: [H, W, num_intervals, feature_dim]
+    # Phase 1: Aggregate features AND rasterized opacities into depth intervals
+    # Output:
+    #   interval_features: [H, W, num_intervals, feature_dim]
+    #   interval_opacities: [H, W, num_intervals] - averaged Gaussian opacities
 
-    # DEBUG: Print tensor shapes before CUDA call (only after iteration 635)
-    if debug_iteration is not None and debug_iteration >= 635:
-        print(f"\n[DEBUG Iter {debug_iteration}] Before rasterize_neural_intervals:")
-        print(f"  means3D.shape: {means3D.shape}")
-        print(f"  features_neural.shape: {features_neural.shape}")
-        print(f"  opacity.shape: {opacity.shape}")
-        print(f"  scales.shape: {scales.shape}")
-        print(f"  rotations.shape: {rotations.shape}")
-        print(f"  Image size: {raster_settings.image_height}x{raster_settings.image_width}")
-        print(f"  num_intervals: {num_intervals}, feature_dim: {feature_dim}")
+    if debug_iteration is not None and debug_iteration % 1000 == 0:
+        print(f"\n[MLP-Opacity Mode Iter {debug_iteration}] Starting rasterization...")
 
-        # Check for NaN/Inf values in tensors
-        print(f"  Checking for NaN/Inf:")
-        print(f"    means3D: NaN={torch.isnan(means3D).any().item()}, Inf={torch.isinf(means3D).any().item()}")
-        print(f"    features_neural: NaN={torch.isnan(features_neural).any().item()}, Inf={torch.isinf(features_neural).any().item()}")
-        print(f"    opacity: NaN={torch.isnan(opacity).any().item()}, Inf={torch.isinf(opacity).any().item()}, min={opacity.min().item():.6f}, max={opacity.max().item():.6f}")
-        print(f"    scales: NaN={torch.isnan(scales).any().item()}, Inf={torch.isinf(scales).any().item()}, min={scales.min().item():.6f}, max={scales.max().item():.6f}")
-        print(f"    rotations: NaN={torch.isnan(rotations).any().item()}, Inf={torch.isinf(rotations).any().item()}")
-
-        # Check camera matrices for NaN/Inf
-        viewmatrix = viewpoint_camera.world_view_transform
-        projmatrix = viewpoint_camera.full_proj_transform
-        print(f"  Camera matrices:")
-        print(f"    viewmatrix: NaN={torch.isnan(viewmatrix).any().item()}, Inf={torch.isinf(viewmatrix).any().item()}")
-        print(f"    projmatrix: NaN={torch.isnan(projmatrix).any().item()}, Inf={torch.isinf(projmatrix).any().item()}")
-        print(f"    campos: {viewpoint_camera.camera_center}")
-
-        # Check cov3D_precomp if it exists
-        if cov3D_precomp is not None:
-            print(f"    cov3D_precomp: NaN={torch.isnan(cov3D_precomp).any().item()}, Inf={torch.isinf(cov3D_precomp).any().item()}")
-
-        # Print actual value ranges to detect subtle issues
-        print(f"  Value ranges:")
-        print(f"    means3D: min={means3D.min().item():.6f}, max={means3D.max().item():.6f}")
-        print(f"    features_neural: min={features_neural.min().item():.6f}, max={features_neural.max().item():.6f}")
-        print(f"    scales: [{scales[:, 0].min().item():.6f}, {scales[:, 1].min().item():.6f}, {scales[:, 2].min().item():.6f}] to [{scales[:, 0].max().item():.6f}, {scales[:, 1].max().item():.6f}, {scales[:, 2].max().item():.6f}]")
-        print(f"    rotations: min={rotations.min().item():.6f}, max={rotations.max().item():.6f}")
-
-    interval_features, radii = rasterize_neural_intervals(
+    interval_features, interval_opacities, radii = rasterize_neural_intervals(
         means3D=means3D,
         features_neural=features_neural,
         opacities=opacity,
@@ -172,49 +145,32 @@ def render_neural_intervals(
         feature_dim=feature_dim
     )
 
-    # Force CUDA synchronization to detect errors immediately
-    if debug_iteration is not None and debug_iteration >= 635:
-        torch.cuda.synchronize()
-        print(f"[DEBUG Iter {debug_iteration}] After rasterize_neural_intervals - CUDA sync OK")
+    if debug_iteration is not None and debug_iteration % 1000 == 0:
         print(f"  interval_features.shape: {interval_features.shape}")
+        print(f"  interval_opacities.shape: {interval_opacities.shape}")
         print(f"  radii.shape: {radii.shape}")
 
-    # Phase 2: Two-stage MLP decoding
-    # Stage 2a: Compute view directions for each pixel
+    # Phase 2: MLP decoding (RGB only - no density prediction)
     H, W, N, F = interval_features.shape
 
-    # Get camera viewing direction for each pixel
-    # Camera looks down -Z in camera space, so view direction is (0, 0, -1)
-    # Transform to world space using inverse view matrix
-    cam_center = viewpoint_camera.camera_center  # [3]
-
     # Compute view direction for each pixel
-    # For now, use camera center direction (could be improved with per-pixel rays)
-    # Shape: [H, W, 3]
-    # Extract camera -Z axis (viewing direction) and ensure it's on CUDA
     cam_view_transform = viewpoint_camera.world_view_transform.to('cuda')
     view_dir = -cam_view_transform[:3, 2].unsqueeze(0).unsqueeze(0)  # Camera -Z axis
     view_dir = view_dir.expand(H, W, 3).contiguous()
-
-    # Normalize view directions
     view_dir = view_dir / (torch.norm(view_dir, dim=-1, keepdim=True) + 1e-6)
 
     # Expand to all intervals: [H, W, N, 3]
     view_dirs_expanded = view_dir.unsqueeze(2).expand(H, W, N, 3)
 
-    # Stage 2b: Reshape for MLP processing
-    # [H*W*N, feature_dim] and [H*W*N, 3]
+    # Reshape for MLP processing
     features_flat = interval_features.reshape(-1, F)
     view_dirs_flat = view_dirs_expanded.reshape(-1, 3)
 
-    # Stage 2c: Evaluate two-stage MLP in batches to avoid OOM
-    # tiny-cuda-nn expects FP16 input
-    # Process in batches of 2^18 (262144) samples to limit memory usage
+    # Evaluate RGB-only MLP in batches
     batch_size = 2**18  # ~256K samples per batch
     total_samples = features_flat.shape[0]
 
     rgb_flat = torch.empty((total_samples, 3), dtype=torch.float32, device='cuda')
-    density_flat = torch.empty((total_samples, 1), dtype=torch.float32, device='cuda')
 
     with torch.amp.autocast('cuda', enabled=False):
         for i in range(0, total_samples, batch_size):
@@ -224,28 +180,33 @@ def render_neural_intervals(
             features_batch = features_flat[i:end_idx]
             view_dirs_batch = view_dirs_flat[i:end_idx]
 
-            # Ensure correct dtype (tiny-cuda-nn often requires float16)
+            # Ensure correct dtype (tiny-cuda-nn requires float16)
             if features_batch.dtype != torch.float16:
                 features_batch = features_batch.contiguous().to(torch.float16)
             if view_dirs_batch.dtype != torch.float16:
                 view_dirs_batch = view_dirs_batch.contiguous().to(torch.float16)
 
-            # Two-stage MLP forward
-            mlp_output = mlp(features_batch, view_dirs_batch)  # Returns dict with 'rgb' and 'density'
+            # RGB-only MLP forward (returns RGB directly, no density)
+            rgb_batch = mlp(features_batch, view_dirs_batch)  # [B, 3]
 
-            # Extract RGB and density and convert to FP32
-            rgb_flat[i:end_idx] = mlp_output['rgb'].float()
-            density_flat[i:end_idx] = mlp_output['density'].float()
+            # Store RGB (convert to FP32)
+            rgb_flat[i:end_idx] = rgb_batch.float()
 
-    # Stage 2d: Reshape back to image space: [H, W, num_intervals, 4]
-    rgb = rgb_flat.reshape(H, W, N, 3)
-    density = density_flat.reshape(H, W, N, 1)
-    decoded_intervals = torch.cat([rgb, density], dim=-1)  # [H, W, N, 4]
+    # Reshape back to image space: [H, W, num_intervals, 3]
+    decoded_colors = rgb_flat.reshape(H, W, N, 3)
 
-    # Phase 3: Composite into final image
+    if debug_iteration is not None and debug_iteration % 1000 == 0:
+        print(f"  decoded_colors.shape: {decoded_colors.shape}")
+        print(f"  decoded_colors range: [{decoded_colors.min().item():.4f}, {decoded_colors.max().item():.4f}]")
+
+    # Phase 3: Composite into final image using rasterized opacities for density
+    # Input:
+    #   - decoded_colors: [H, W, N, 3] from MLP
+    #   - interval_opacities: [H, W, N] from rasterization
     # Output: [H, W, 3]
-    final_image = composite_neural(
-        decoded_intervals=decoded_intervals,
+    final_image = composite_mlp_opacity(
+        decoded_colors=decoded_colors,
+        interval_opacities=interval_opacities,
         background=bg_color,
         raster_settings=raster_settings,
         num_intervals=num_intervals,
@@ -255,6 +216,10 @@ def render_neural_intervals(
 
     # Transpose to [3, H, W] to match expected format
     final_image = final_image.permute(2, 0, 1)  # [H, W, 3] -> [3, H, W]
+
+    if debug_iteration is not None and debug_iteration % 1000 == 0:
+        print(f"  final_image.shape: {final_image.shape}")
+        print(f"  final_image range: [{final_image.min().item():.4f}, {final_image.max().item():.4f}]")
 
     # Return results
     return {

@@ -114,8 +114,8 @@ class OptimizationParams(ParamGroup):
         self.grid_update_interval = 16
         self.grid_warmup_steps = 256
 
-        # Interval blending mode: compositing (original working), naive, gaussian, g-nerf, mlp-nerf
-        self.blending = "compositing"
+        # Interval blending mode: compositing (original working), naive, gaussian, g-nerf, mlp-nerf, mlp-density, mlp-opacity
+        self.blending = "mlp-nerf"
 
         # Neural Interval Splatting parameters
         self.num_intervals = 16  # Number of depth intervals for neural interval splatting
