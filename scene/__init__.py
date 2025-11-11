@@ -98,3 +98,62 @@ class Scene:
 
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]
+
+    def compute_aabb(self, margin=0.1):
+        """
+        Compute axis-aligned bounding box for the scene.
+
+        Uses camera positions and scene extent to determine a bounding volume
+        that encompasses the entire scene.
+
+        Args:
+            margin: Relative margin to add around the bounding box (default: 10%)
+
+        Returns:
+            torch.Tensor: AABB as [xmin, ymin, zmin, xmax, ymax, zmax]
+        """
+        import torch
+
+        # Collect all camera positions
+        camera_positions = []
+        for scale in self.train_cameras:
+            for cam in self.train_cameras[scale]:
+                # Camera position is the translation component of world_view_transform
+                cam_pos = cam.camera_center
+                camera_positions.append(cam_pos)
+
+        if len(camera_positions) == 0:
+            # Fallback: use cameras_extent centered at origin
+            extent = self.cameras_extent
+            aabb = torch.tensor(
+                [-extent, -extent, -extent, extent, extent, extent],
+                dtype=torch.float32,
+                device="cuda"
+            )
+            return aabb
+
+        # Stack camera positions
+        camera_positions = torch.stack(camera_positions)  # [N, 3]
+
+        # Compute bounding box from camera positions
+        aabb_min = camera_positions.min(dim=0)[0]  # [3]
+        aabb_max = camera_positions.max(dim=0)[0]  # [3]
+
+        # Expand by cameras_extent to include visible region
+        extent_vec = torch.tensor(
+            [self.cameras_extent, self.cameras_extent, self.cameras_extent],
+            dtype=torch.float32,
+            device=camera_positions.device
+        )
+        aabb_min = aabb_min - extent_vec
+        aabb_max = aabb_max + extent_vec
+
+        # Add margin
+        extent = aabb_max - aabb_min
+        aabb_min = aabb_min - margin * extent
+        aabb_max = aabb_max + margin * extent
+
+        # Concatenate to [6] tensor
+        aabb = torch.cat([aabb_min, aabb_max])
+
+        return aabb

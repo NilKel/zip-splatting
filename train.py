@@ -43,19 +43,114 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
+# ZIP method: NerfAcc occupancy grid
+try:
+    from nerfacc import OccGridEstimator
+    from utils.occupancy_utils import (
+        scatter_gaussians_to_occupancy,
+        lookup_precomputed_occupancy
+    )
+    from gaussian_renderer.zip_render import render_zip
+    NERFACC_AVAILABLE = True
+except ImportError:
+    NERFACC_AVAILABLE = False
+    print("Warning: NerfAcc not available. ZIP method will not work.")
+
+# Neural Interval Splatting with MLP-NeRF
+try:
+    import tinycudann as tcnn
+    from gaussian_renderer.neural_render import render_neural_intervals
+    TCNN_AVAILABLE = True
+except ImportError:
+    TCNN_AVAILABLE = False
+    print("Warning: tiny-cuda-nn not available. MLP-NeRF blending will not work.")
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
 
     first_iter = 0
-    tb_writer = prepare_output_and_logger(dataset)
+    tb_writer = prepare_output_and_logger(dataset, opt)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+
+    # Compute scene AABB for NGP-style intervals
+    scene_aabb = None
+    if dataset.method == "zip" and opt.use_ngp_intervals:
+        scene_aabb = scene.compute_aabb(margin=0.1)
+        print(f"Computed scene AABB: {scene_aabb.cpu().numpy()}")
+
+    # Initialize occupancy grid for ZIP method
+    estimator = None
+    precomputed_occ = None
+    # DISABLED: Old remnant code
+    # if dataset.method == "zip":
+    #     if not NERFACC_AVAILABLE:
+    #         sys.exit("ZIP method requires NerfAcc, but it's not available. Please install nerfacc.")
+
+    #     print(f"Initializing OccGridEstimator for ZIP method...")
+    #     print(f"  Resolution: {opt.grid_resolution}")
+    #     print(f"  Levels: {opt.grid_levels}")
+    #     print(f"  Update interval: {opt.grid_update_interval}")
+    #     print(f"  Warmup steps: {opt.grid_warmup_steps}")
+
+    #     # Compute scene AABB
+    #     aabb = scene.compute_aabb(margin=0.1)
+    #     print(f"  Scene AABB: {aabb.cpu().numpy()}")
+
+    #     # Initialize estimator
+    #     estimator = OccGridEstimator(
+    #         roi_aabb=aabb.cpu().tolist(),  # NerfAcc expects list
+    #         resolution=opt.grid_resolution,
+    #         levels=opt.grid_levels
+    #     ).to("cuda")
+    #     estimator.train()
+
+    #     print("OccGridEstimator initialized successfully.")
+
+    # Initialize MLP for neural interval rendering (mlp-nerf mode)
+    mlp = None
+    mlp_optimizer = None
+    if opt.blending == "mlp-nerf":
+        if not TCNN_AVAILABLE:
+            sys.exit("MLP-NeRF blending requires tiny-cuda-nn, but it's not available. Please install tiny-cuda-nn.")
+
+        print(f"Initializing MLP for Neural Interval Splatting...")
+        print(f"  Feature dim: {gaussians.feature_dim}")
+        print(f"  Output: 4 (RGB + density)")
+
+        # Create tiny-cuda-nn MLP
+        # Input: neural features [feature_dim]
+        # Output: 4 (RGB + density)
+        mlp_config = {
+            "encoding": {
+                "otype": "Identity"  # No encoding, just pass features through
+            },
+            "network": {
+                "otype": "FullyFusedMLP",
+                "activation": "ReLU",
+                "output_activation": "None",
+                "n_neurons": 64,
+                "n_hidden_layers": 2
+            }
+        }
+
+        mlp = tcnn.NetworkWithInputEncoding(
+            n_input_dims=gaussians.feature_dim,
+            n_output_dims=4,  # RGB + density
+            encoding_config=mlp_config["encoding"],
+            network_config=mlp_config["network"]
+        ).to("cuda")
+
+        # Create optimizer for MLP
+        mlp_optimizer = torch.optim.Adam(mlp.parameters(), lr=1e-3)
+
+        print("MLP initialized successfully.")
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -111,7 +206,88 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+        # ZIP method: Update occupancy grid
+        # DISABLED: Old remnant code
+        # if dataset.method == "zip" and estimator is not None:
+        #     if iteration % opt.grid_update_interval == 0:
+        #         # Scatter Gaussians into voxel occupancy grid
+        #         with torch.no_grad():
+        #             precomputed_occ = scatter_gaussians_to_occupancy(
+        #                 gaussians,
+        #                 grid_resolution=estimator.resolution,
+        #                 grid_aabb=torch.tensor(estimator.aabbs[0].cpu().numpy(), device="cuda"),
+        #                 levels=opt.grid_levels
+        #             )
+
+        #             # Create occ_eval_fn for NerfAcc
+        #             def occ_eval_fn(positions):
+        #                 """
+        #                 Lookup precomputed occupancy at query positions.
+        #                 positions: [N, 3] world-space coordinates
+        #                 returns: [N, 1] occupancy values
+        #                 """
+        #                 return lookup_precomputed_occupancy(
+        #                     positions,
+        #                     precomputed_occ,
+        #                     grid_resolution=estimator.resolution,
+        #                     grid_aabb=torch.tensor(estimator.aabbs[0].cpu().numpy(), device="cuda"),
+        #                     levels=opt.grid_levels
+        #                 )
+
+        #             # Update NerfAcc estimator
+        #             estimator.update_every_n_steps(
+        #                 step=iteration,
+        #                 occ_eval_fn=occ_eval_fn,
+        #                 occ_thre=1e-2,
+        #                 ema_decay=0.95,
+        #                 warmup_steps=opt.grid_warmup_steps,
+        #                 n=opt.grid_update_interval
+        #             )
+
+        #             # Log grid statistics
+        #             if iteration % (opt.grid_update_interval * 10) == 0:
+        #                 occupied_voxels = (estimator.occs > 0).sum().item()
+        #                 total_voxels = estimator.occs.shape[0]
+        #                 occupancy_pct = 100.0 * occupied_voxels / total_voxels
+        #                 print(f"[Iter {iteration}] Grid occupancy: {occupancy_pct:.2f}% ({occupied_voxels}/{total_voxels} voxels)")
+
+        # Render: Use appropriate renderer based on method and blending mode
+        if dataset.method == "zip" and opt.blending == "mlp-nerf":
+            # Use Neural Interval Splatting renderer
+            render_pkg = render_neural_intervals(
+                viewpoint_cam, gaussians, mlp, pipe, bg,
+                num_intervals=opt.num_intervals,
+                near_depth=opt.near_plane,
+                far_depth=opt.far_plane,
+                feature_dim=gaussians.feature_dim,
+                scaling_modifier=1.0,
+                override_color=None,
+                debug_iteration=None,  # Disable debug output
+                use_ngp_intervals=opt.use_ngp_intervals,
+                scene_aabb=scene_aabb
+            )
+        elif dataset.method == "zip":
+            # Use ZIP renderer with standard interval blending
+            render_pkg = render_zip(
+                viewpoint_cam, gaussians, pipe, bg,
+                estimator=estimator,
+                use_trained_exp=dataset.train_test_exp,
+                separate_sh=SPARSE_ADAM_AVAILABLE,
+                use_intervals=True,  # Always use intervals for ZIP method
+                blending_mode=opt.blending,
+                num_intervals=opt.num_intervals,
+                near_depth=opt.near_plane,
+                far_depth=opt.far_plane,
+                use_ngp_intervals=opt.use_ngp_intervals,
+                scene_aabb=scene_aabb
+            )
+        else:
+            # Use baseline renderer
+            render_pkg = render(
+                viewpoint_cam, gaussians, pipe, bg,
+                use_trained_exp=dataset.train_test_exp,
+                separate_sh=SPARSE_ADAM_AVAILABLE
+            )
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         # if viewpoint_cam.alpha_mask is not None:
@@ -136,13 +312,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             depth_mask = viewpoint_cam.depth_mask.cuda()
 
             Ll1depth_pure = torch.abs((invDepth  - mono_invdepth) * depth_mask).mean()
-            Ll1depth = depth_l1_weight(iteration) * Ll1depth_pure 
+            Ll1depth = depth_l1_weight(iteration) * Ll1depth_pure
             loss += Ll1depth
             Ll1depth = Ll1depth.item()
         else:
             Ll1depth = 0
 
         loss.backward()
+
+        # For neural rendering, create dummy gradients for screenspace points
+        # since they're not connected to the loss (we optimize neural features instead)
+        if opt.blending == "mlp-nerf" and viewspace_point_tensor.grad is None:
+            viewspace_point_tensor.grad = torch.zeros_like(viewspace_point_tensor)
 
         iter_end.record()
 
@@ -170,11 +351,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                    old_count = gaussians.get_xyz.shape[0]
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
-                
+                    new_count = gaussians.get_xyz.shape[0]
+                    print(f"\n[ITER {iteration}] Densification: {old_count} -> {new_count} Gaussians (delta: {new_count - old_count:+d})")
+                    # Synchronize CUDA after densification to ensure all operations complete
+                    torch.cuda.synchronize()
+
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
+                    torch.cuda.synchronize()
 
             # Optimizer step
             if iteration < opt.iterations:
@@ -188,24 +375,30 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.optimizer.step()
                     gaussians.optimizer.zero_grad(set_to_none = True)
 
+                # MLP optimizer step for neural interval rendering
+                if mlp_optimizer is not None:
+                    mlp_optimizer.step()
+                    mlp_optimizer.zero_grad(set_to_none = True)
+
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
     
     # Render test images at the end of training
     if opt.test_image_stride > 0:
-        render_test_images(scene, gaussians, pipe, background, dataset.model_path, opt.test_image_stride, dataset.train_test_exp, SPARSE_ADAM_AVAILABLE)
+        render_test_images(scene, gaussians, pipe, background, dataset, opt, estimator, SPARSE_ADAM_AVAILABLE, mlp)
 
-def render_test_images(scene, gaussians, pipeline, background, model_path, stride, train_test_exp, separate_sh):
+def render_test_images(scene, gaussians, pipeline, background, dataset, opt, estimator, separate_sh, mlp=None):
     """Render test images with GT and rendered views separately"""
+    stride = opt.test_image_stride
     print("\n[Rendering test images with stride {}]".format(stride))
     test_cameras = scene.getTestCameras()
     if len(test_cameras) == 0:
         print("No test cameras found, skipping test image rendering.")
         return
-    
+
     # Create output directory
-    test_images_path = os.path.join(model_path, "test_images")
+    test_images_path = os.path.join(dataset.model_path, "test_images")
     makedirs(test_images_path, exist_ok=True)
     
     # Get indices to render: 0, stride, 2*stride, ...
@@ -227,10 +420,34 @@ def render_test_images(scene, gaussians, pipeline, background, model_path, strid
         with open(metrics_path, "w") as mf:
             mf.write("index, PSNR, SSIM, LPIPS\n")
             for actual_idx, view in zip(indices_to_render, tqdm(cameras_to_render, desc="Rendering test images")):
-                rendering = render(view, gaussians, pipeline, background, use_trained_exp=train_test_exp, separate_sh=separate_sh)["render"]
+                # Use appropriate renderer based on method and blending mode
+                if dataset.method == "zip" and opt.blending == "mlp-nerf" and mlp is not None:
+                    # Use Neural Interval Splatting renderer
+                    rendering = render_neural_intervals(
+                        view, gaussians, mlp, pipeline, background,
+                        num_intervals=16,
+                        near_depth=0.1,
+                        far_depth=100.0,
+                        feature_dim=gaussians.feature_dim,
+                        scaling_modifier=1.0,
+                        override_color=None
+                    )["render"]
+                elif dataset.method == "zip":
+                    # Use ZIP renderer with standard interval blending
+                    rendering = render_zip(
+                        view, gaussians, pipeline, background,
+                        estimator=estimator,
+                        use_trained_exp=dataset.train_test_exp,
+                        separate_sh=separate_sh,
+                        use_intervals=True,
+                        blending_mode=opt.blending
+                    )["render"]
+                else:
+                    # Use baseline renderer
+                    rendering = render(view, gaussians, pipeline, background, use_trained_exp=dataset.train_test_exp, separate_sh=separate_sh)["render"]
                 gt = view.original_image[0:3, :, :]
-                
-                if train_test_exp:
+
+                if dataset.train_test_exp:
                     rendering = rendering[..., rendering.shape[-1] // 2:]
                     gt = gt[..., gt.shape[-1] // 2:]
                 
@@ -265,18 +482,18 @@ def render_test_images(scene, gaussians, pipeline, background, model_path, strid
     
     print(f"Test images saved to {test_images_path}")
 
-def prepare_output_and_logger(dataset):    
+def prepare_output_and_logger(dataset, opt):
     if not dataset.model_path:
         if dataset.name:
             # Extract dataset and scene names from source path
             source_path = os.path.abspath(dataset.source_path)
             path_parts = source_path.split(os.sep)
-            
+
             # Try to find dataset name (e.g., "nerf_synthetic") and scene name (e.g., "drums")
             # Look for common patterns: .../dataset/scene or .../dataset/.../scene
             dataset_name = "unknown"
             scene_name = "unknown"
-            
+
             # Common dataset names to look for
             dataset_keywords = ["nerf_synthetic", "nerf_synthetic_colmap", "mipnerf360", "tanksandtemples", "deepblending"]
             for keyword in dataset_keywords:
@@ -289,14 +506,19 @@ def prepare_output_and_logger(dataset):
                     elif len(path_parts) > 0:
                         scene_name = path_parts[-1]
                     break
-            
+
             # If no dataset keyword found, use parent directory as dataset and last part as scene
             if dataset_name == "unknown" and len(path_parts) >= 2:
                 dataset_name = path_parts[-2] if len(path_parts) >= 2 else "unknown"
                 scene_name = path_parts[-1]
-            
-            # Construct output path: output/dataset/scene/method/name
-            dataset.model_path = os.path.join("./output/", dataset_name, scene_name, dataset.method, dataset.name)
+
+            # Construct output path
+            # For ZIP method: output/dataset/scene/method/blending/name
+            # For other methods: output/dataset/scene/method/name
+            if dataset.method == "zip":
+                dataset.model_path = os.path.join("./output/", dataset_name, scene_name, dataset.method, opt.blending, dataset.name)
+            else:
+                dataset.model_path = os.path.join("./output/", dataset_name, scene_name, dataset.method, dataset.name)
         else:
             # Fallback to original UUID-based naming
             if os.getenv('OAR_JOB_ID'):

@@ -99,7 +99,7 @@ class OptimizationParams(ParamGroup):
         self.lambda_dssim = 0.2
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
-        self.densify_from_iter = 500
+        self.densify_from_iter = 900
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0002
         self.depth_l1_weight_init = 1.0
@@ -107,6 +107,22 @@ class OptimizationParams(ParamGroup):
         self.random_background = False
         self.optimizer_type = "default"
         self.test_image_stride = 25
+
+        # ZIP method: NerfAcc occupancy grid parameters
+        self.grid_resolution = 128
+        self.grid_levels = 1
+        self.grid_update_interval = 16
+        self.grid_warmup_steps = 256
+
+        # Interval blending mode: compositing (original working), naive, gaussian, g-nerf, mlp-nerf
+        self.blending = "compositing"
+
+        # Neural Interval Splatting parameters
+        self.num_intervals = 16  # Number of depth intervals for neural interval splatting
+        self.near_plane = 0.01   # Near plane for interval computation
+        self.far_plane = 100.0   # Far plane for interval computation
+        self.use_ngp_intervals = False  # Use NGP-style adaptive intervals (Δt = √3/1024 for unit cube)
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
